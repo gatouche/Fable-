@@ -150,7 +150,9 @@ def apparier(rejets, sens: str, tick: float):
 # Simulation
 # ---------------------------------------------------------------------------
 
-def simuler(paires, px, tns, sens: str, tick: float):
+def simuler(paires, px, tns, sens: str, tick: float,
+            stop_ticks=STOP_TICKS, max_risque=MAX_RISQUE_TICKS,
+            horizon_min=HORIZON_MIN):
     """
     Entree au moment de la confirmation du 2e rejet, stop au-dela de B2.
 
@@ -159,7 +161,7 @@ def simuler(paires, px, tns, sens: str, tick: float):
     dit ou placer les sorties — pas une regle choisie a l'avance.
     """
     short = sens == "buy"                 # rejet acheteur -> on vend
-    horizon_ns = HORIZON_MIN * 60 * NS
+    horizon_ns = horizon_min * 60 * NS
     lignes = []
     sans_suite = trop_loin = 0
 
@@ -171,9 +173,9 @@ def simuler(paires, px, tns, sens: str, tick: float):
             continue
 
         entree = float(px[lo - 1]) if lo > 0 else float(px[lo])
-        stop = B2 + STOP_TICKS * tick if short else B2 - STOP_TICKS * tick
+        stop = B2 + stop_ticks * tick if short else B2 - stop_ticks * tick
         risque = abs(stop - entree) / tick
-        if risque > MAX_RISQUE_TICKS:
+        if risque > max_risque:
             trop_loin += 1
             continue
 
@@ -216,7 +218,7 @@ def simuler(paires, px, tns, sens: str, tick: float):
 
     if trop_loin or sans_suite:
         print(f"  {trop_loin} sequence(s) ecartee(s) : entree a plus de "
-              f"{MAX_RISQUE_TICKS} ticks du stop"
+              f"{max_risque} ticks du stop"
               + (f", {sans_suite} sans tape ensuite" if sans_suite else ""))
     return pd.DataFrame(lignes)
 
@@ -278,6 +280,12 @@ def main():
     ap.add_argument("--fin", default=SESSION_END)
     ap.add_argument("--confirm", type=int, default=CONFIRM_SECS)
     ap.add_argument("--niveaux", type=int, default=MIN_LEVELS)
+    ap.add_argument("--risque", type=float, default=MAX_RISQUE_TICKS,
+                    help="ecart max entree-stop en ticks (defaut 8)")
+    ap.add_argument("--stop", type=float, default=STOP_TICKS,
+                    help="stop a N ticks au-dela de B2 (defaut 1)")
+    ap.add_argument("--horizon", type=int, default=HORIZON_MIN,
+                    help="duree max de suivi en minutes (defaut 60)")
     args = ap.parse_args()
 
     print(f"Chargement de {args.fichier} ...")
@@ -313,7 +321,9 @@ def main():
     paires = apparier(rejets, args.sens, TICK)
     print(f"  {len(paires):,} sequences de double rejet")
 
-    df = simuler(paires, px, tns, args.sens, TICK)
+    df = simuler(paires, px, tns, args.sens, TICK,
+                 stop_ticks=args.stop, max_risque=args.risque,
+                 horizon_min=args.horizon)
     rapport(df)
 
     if len(df):
