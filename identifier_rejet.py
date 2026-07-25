@@ -38,6 +38,7 @@ SESSION_END   = "14:45"
 GROUP_MS       = 50    # executions plus rapprochees que ca = un seul ordre
 CONFIRM_SECS   = 3     # duree sans depassement pour valider un rejet
 SEQ_MAX_SECS   = 120   # 2 minutes max entre la fin des deux evenements
+SEQ_MIN_SECS   = 5      # plancher : en dessous, probablement le meme sursaut
 GAP_MAX_POINTS = 3      # ecart max entre B1 et B2, en points d'indice
 
 
@@ -115,9 +116,10 @@ def confirmer(ev: pd.DataFrame, px: np.ndarray, tns: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def identifier(rejets: list, sens: str, gap_max_points: float,
-               seq_max_secs: int) -> pd.DataFrame:
+               seq_max_secs: int, seq_min_secs: float = 0) -> pd.DataFrame:
     lignes = []
     seq_max_ns = seq_max_secs * NS
+    seq_min_ns = seq_min_secs * NS
     i = 0
     while i < len(rejets) - 1:
         r1, r2 = rejets[i], rejets[i + 1]
@@ -125,7 +127,9 @@ def identifier(rejets: list, sens: str, gap_max_points: float,
         gap_points = (r1.B - r2.B) if sens == "buy" else (r2.B - r1.B)
 
         degrade = gap_points > 0                     # B2 plus faible que B1
-        dans_le_temps = ecart_ns <= seq_max_ns
+        # sous seq_min_secs : probablement le meme sursaut fragmente en deux
+        # evenements, pas deux tentatives distinctes
+        dans_le_temps = seq_min_ns <= ecart_ns <= seq_max_ns
         dans_le_prix = 0 < gap_points <= gap_max_points
 
         if degrade and dans_le_temps and dans_le_prix:
@@ -205,6 +209,9 @@ def main():
                     help="ecart de prix max entre B1 et B2, en points")
     ap.add_argument("--seq-max", type=int, default=SEQ_MAX_SECS,
                     help="delai max entre les deux rejets, en secondes")
+    ap.add_argument("--seq-min", type=float, default=SEQ_MIN_SECS,
+                    help="delai min entre les deux rejets, en secondes "
+                         "(exclut les fragments d'un meme sursaut)")
     ap.add_argument("--group-ms", type=int, default=GROUP_MS)
     args = ap.parse_args()
 
@@ -233,9 +240,9 @@ def main():
     rejets = confirmer(ev, px, tns, args.sens, args.confirm * NS)
     print(f"  {len(rejets):,} rejets confirmes ({args.confirm}s sans depassement)")
 
-    df = identifier(rejets, args.sens, args.gap_max, args.seq_max)
+    df = identifier(rejets, args.sens, args.gap_max, args.seq_max, args.seq_min)
     print(f"  {len(df):,} sequences identifiees "
-          f"(ecart <= {args.gap_max} pts, delai <= {args.seq_max}s)")
+          f"(ecart <= {args.gap_max} pts, delai {args.seq_min}-{args.seq_max}s)")
 
     rapport(df, args.sens)
 
