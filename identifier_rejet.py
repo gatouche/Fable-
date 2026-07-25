@@ -1,7 +1,16 @@
 """
-Identification pure du pattern de double rejet — AUCUNE simulation de trade.
+Identification du pattern de double rejet + deux analyses complementaires :
 
-Pattern :
+  A. Verification du "chemin du retour" : entre la confirmation du 2e rejet
+     et l'issue (invalidation ou horizon), y a-t-il un rejet CONFIRME du
+     cote OPPOSE (une rejection vendeuse qui vient contester la baisse
+     attendue apres un double rejet acheteur, et inversement) ?
+
+  B. Backtest approximatif : entree au marche juste apres confirmation du
+     2e rejet, stop juste au-dela de B2, cible a --target points. Resultats
+     bruts, a considerer comme un premier ordre de grandeur.
+
+Pattern de base (inchange) :
     1. Un evenement above-ask (ou below-bid) se produit, culminant a B1.
     2. Il est rejete : le prix ne redepasse pas B1 pendant CONFIRM_SECS.
     3. Un second evenement, de meme sens, se produit, culminant a B2, avec
@@ -13,12 +22,12 @@ Pattern :
        SEQ_MAX_SECS secondes.
 
 Le volume n'intervient dans AUCUN critere de filtrage — il est seulement
-affiche pour information. Ce script liste les occurrences, il ne mesure
-aucune performance (pas d'entree, pas de stop, pas de MFE/MAE).
+affiche pour information.
 
 Usage :
     python identifier_rejet.py ticks_ES_full.csv
     python identifier_rejet.py ticks_ES_full.csv --sens sell --confirm 5
+    python identifier_rejet.py ticks_ES_full.csv --target 1.5 --stop-buffer 0.5
 """
 
 from __future__ import annotations
@@ -41,9 +50,13 @@ SEQ_MAX_SECS   = 120   # 2 minutes max entre la fin des deux evenements
 SEQ_MIN_SECS   = 5      # plancher : en dessous, probablement le meme sursaut
 GAP_MAX_POINTS = 3      # ecart max entre B1 et B2, en points d'indice
 
+TARGET_POINTS  = 1.0    # cible du backtest, en points
+STOP_BUFFER    = 0.25   # marge du stop au-dela de B2, en points (1 tick)
+COUT_ALLER_RETOUR = 0.25  # cout estime d'un aller-retour, en points (info)
+
 
 # ---------------------------------------------------------------------------
-# Chargement + classification (identique a rejet_above.py)
+# Chargement + classification
 # ---------------------------------------------------------------------------
 
 def charger(path: str) -> pd.DataFrame:
@@ -206,8 +219,105 @@ def mesurer_suite(df: pd.DataFrame, px: np.ndarray, tns: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# A. Chemin du retour — un rejet confirme du cote OPPOSE apparait-il avant
+#    l'issue (invalidation ou horizon) ? Purement descriptif : compte le
+#    nombre de rejets opposes dans la fenetre et le delai jusqu'au premier.
+# ---------------------------------------------------------------------------
 
-def rapport(df: pd.DataFrame, sens: str):
+def verifier_chemin_oppose(df: pd.DataFrame, rejets_opposes: list,
+                            confirm_secs: int, horizon_secs: int) -> pd.DataFrame:
+    confirm_ns = confirm_secs * NS
+    horizon_ns = horizon_secs * NS
+
+    fins_opp = np.array(sorted(pd.Timestamp(r.fin).value for r in rejets_opposes),
+                         dtype="int64")
+
+    n_contra, t_premier = [], []
+    for r in df.itertuples():
+        origin_ns = pd.Timestamp(r.t_rejet_2).value + confirm_ns
+        if bool(r.invalide):
+            fin_fenetre_ns = origin_ns + int(round(r.t_invalide_s * NS))
+        else:
+            fin_fenetre_ns = origin_ns + horizon_ns
+
+        if fins_opp.size:
+            lo = int(np.searchsorted(fins_opp, origin_ns, side="right"))
+            hi = int(np.searchsorted(fins_opp, fin_fenetre_ns, side="right"))
+        else:
+            lo = hi = 0
+        n = hi - lo
+        n_contra.append(n)
+        t_premier.append(round((fins_opp[lo] - origin_ns) / NS, 1) if n > 0 else np.nan)
+
+    df = df.copy()
+    df["contra_rejets"] = n_contra
+    df["t_premier_contra_s"] = t_premier
+    return df
+
+
+# ---------------------------------------------------------------------------
+# B. Backtest approximatif — entree au marche, stop au-dela de B2, cible a
+#    --target points. Premier des deux touche = issue du trade.
+# ---------------------------------------------------------------------------
+
+def simuler_trade(df: pd.DataFrame, px: np.ndarray, tns: np.ndarray, sens: str,
+                   confirm_secs: int, target_points: float, stop_buffer: float,
+                   horizon_secs: int) -> pd.DataFrame:
+    confirm_ns = confirm_secs * NS
+    horizon_ns = horizon_secs * NS
+
+    pnl, issue, t_issue, entree_l = [], [], [], []
+
+    for r in df.itertuples():
+        origin_ns = pd.Timestamp(r.t_rejet_2).value + confirm_ns
+        cap_ns = origin_ns + horizon_ns
+        lo = int(np.searchsorted(tns, origin_ns, side="right"))
+        hi = int(np.searchsorted(tns, cap_ns, side="right"))
+        if hi <= lo:
+            pnl.append(np.nan); issue.append("pas_de_donnees")
+            t_issue.append(np.nan); entree_l.append(np.nan)
+            continue
+
+        entree = float(px[lo])
+        seg, segt = px[lo:hi], tns[lo:hi]
+
+        if sens == "buy":                       # double rejet acheteur -> on VEND
+            stop = r.B2 + stop_buffer
+            cible = entree - target_points
+            touche_stop = seg >= stop
+            touche_cible = seg <= cible
+        else:                                   # double rejet vendeur -> on ACHETE
+            stop = r.B2 - stop_buffer
+            cible = entree + target_points
+            touche_stop = seg <= stop
+            touche_cible = seg >= cible
+
+        i_stop = int(np.argmax(touche_stop)) if touche_stop.any() else None
+        i_cible = int(np.argmax(touche_cible)) if touche_cible.any() else None
+
+        entree_l.append(round(entree, 2))
+        if i_stop is None and i_cible is None:
+            pnl.append(np.nan); issue.append("timeout")
+            t_issue.append(np.nan)
+        elif i_cible is not None and (i_stop is None or i_cible <= i_stop):
+            pnl.append(target_points); issue.append("gagnant")
+            t_issue.append(round((int(segt[i_cible]) - origin_ns) / NS, 1))
+        else:
+            perte = -abs(entree - stop)
+            pnl.append(round(perte, 2)); issue.append("perdant")
+            t_issue.append(round((int(segt[i_stop]) - origin_ns) / NS, 1))
+
+    df = df.copy()
+    df["entree"] = entree_l
+    df["pnl_pts"] = pnl
+    df["issue"] = issue
+    df["t_issue_s"] = t_issue
+    return df
+
+
+# ---------------------------------------------------------------------------
+
+def rapport(df: pd.DataFrame, sens: str, target_points: float, cout: float):
     n = len(df)
     print("\n" + "=" * 64)
     print(f"SEQUENCES IDENTIFIEES ({sens}) : {n}")
@@ -243,6 +353,45 @@ def rapport(df: pd.DataFrame, sens: str):
             print(f"  Temps median avant que ca cede      : "
                   f"{df.loc[df['invalide'], 't_invalide_s'].median():.0f} s")
 
+    if "contra_rejets" in df.columns:
+        print("\n--- A. Chemin du retour : rejet confirme du cote OPPOSE ? ---")
+        cote_opp = "vendeuse" if sens == "buy" else "acheteuse"
+        print(f"(entre confirmation du 2e rejet et l'issue, presence d'une rejection {cote_opp})")
+        propre = int((df["contra_rejets"] == 0).sum())
+        conteste = n - propre
+        print(f"  Chemin propre (0 rejet oppose)   : {propre:>4}  ({100*propre/n:5.1f} %)")
+        print(f"  Chemin conteste (>=1 rejet oppose): {conteste:>4}  ({100*conteste/n:5.1f} %)")
+        if propre and conteste:
+            ext_propre = df.loc[df["contra_rejets"] == 0, "ext_max_pts"].median()
+            ext_conteste = df.loc[df["contra_rejets"] > 0, "ext_max_pts"].median()
+            inv_propre = df.loc[df["contra_rejets"] == 0, "invalide"].mean()
+            inv_conteste = df.loc[df["contra_rejets"] > 0, "invalide"].mean()
+            print(f"  Extension mediane si propre   : {ext_propre:.2f} pts"
+                  f"  | B2 cede : {inv_propre:.0%}")
+            print(f"  Extension mediane si conteste : {ext_conteste:.2f} pts"
+                  f"  | B2 cede : {inv_conteste:.0%}")
+            avec_contra = df[df["contra_rejets"] > 0]
+            delai_median = avec_contra["t_premier_contra_s"].median()
+            print(f"  Delai median avant le premier rejet oppose : {delai_median:.0f} s")
+
+    if "pnl_pts" in df.columns:
+        print(f"\n--- B. Backtest approximatif (marche, cible {target_points} pts, "
+              f"stop = B2 +/- buffer) ---")
+        print("(ordre de grandeur seulement — pas de gestion de position, un trade a la fois suppose)")
+        vc = df["issue"].value_counts()
+        for k in ("gagnant", "perdant", "timeout", "pas_de_donnees"):
+            c = int(vc.get(k, 0))
+            print(f"  {k:<14}: {c:>4}  ({100*c/n:5.1f} %)")
+        valides = df["pnl_pts"].dropna()
+        if len(valides):
+            esp = valides.mean()
+            se = valides.std(ddof=1) / np.sqrt(len(valides))
+            esp_net = esp - cout
+            print(f"  Esperance brute  : {esp:+.3f} pts  (+/- {se:.3f} SE, n={len(valides)})")
+            print(f"  Esperance nette  : {esp_net:+.3f} pts  (cout aller-retour estime {cout} pt)")
+            print(f"  Perte moyenne    : {valides[valides < 0].mean():.2f} pts"
+                  if (valides < 0).any() else "  Perte moyenne    : n/a")
+
     print("\n--- Distribution horaire (heure du 2e rejet) ---")
     heures = df["t_rejet_2"].dt.hour
     for h in sorted(heures.unique()):
@@ -251,7 +400,7 @@ def rapport(df: pd.DataFrame, sens: str):
         print(f"  {h:02d}h : {c:>4}  {barre}")
 
     print("\n--- Liste complete ---")
-    with pd.option_context("display.max_rows", None, "display.width", 200):
+    with pd.option_context("display.max_rows", None, "display.width", 220):
         print(df.to_string(index=False))
 
 
@@ -300,6 +449,17 @@ def main():
     ap.add_argument("--horizon", type=int, default=3600,
                     help="duree max de suivi apres confirmation, en secondes "
                          "(defaut 3600 = 1h)")
+    ap.add_argument("--target", type=float, default=TARGET_POINTS,
+                    help="cible du backtest, en points (defaut 1.0)")
+    ap.add_argument("--stop-buffer", type=float, default=STOP_BUFFER,
+                    help="marge du stop au-dela de B2, en points (defaut 0.25 = 1 tick)")
+    ap.add_argument("--cout", type=float, default=COUT_ALLER_RETOUR,
+                    help="cout estime d'un aller-retour, en points, "
+                         "utilise seulement pour l'esperance nette (info)")
+    ap.add_argument("--sans-chemin-oppose", action="store_true",
+                    help="desactive la verification A (plus rapide)")
+    ap.add_argument("--sans-backtest", action="store_true",
+                    help="desactive le backtest B")
     args = ap.parse_args()
 
     print(f"Chargement de {len(args.fichiers)} fichier(s) ...")
@@ -314,27 +474,38 @@ def main():
     print(f"  Session {args.debut}-{args.fin} : {len(session):,} ticks "
           f"({len(session)/n:.1%})")
 
-    colonne = "above" if args.sens == "buy" else "below"
-    ev = grouper(session, session[colonne], args.sens, args.group_ms * 1_000_000)
-    print(f"\n  {len(ev):,} evenements '{colonne}' regroupes "
-          f"(fenetre {args.group_ms} ms)")
-    if ev.empty:
-        return
-
     px  = full["price"].to_numpy(dtype=np.float64)
     tns = full["time"].values.astype("datetime64[ns]").astype("int64")
+    confirm_ns = args.confirm * NS
 
-    rejets = confirmer(ev, px, tns, args.sens, args.confirm * NS)
-    print(f"  {len(rejets):,} rejets confirmes ({args.confirm}s sans depassement)")
+    ev_above = grouper(session, session["above"], "buy", args.group_ms * 1_000_000)
+    ev_below = grouper(session, session["below"], "sell", args.group_ms * 1_000_000)
+    print(f"\n  {len(ev_above):,} evenements 'above' regroupes / "
+          f"{len(ev_below):,} evenements 'below' regroupes (fenetre {args.group_ms} ms)")
 
-    df = identifier(rejets, args.sens, args.gap_max, args.seq_max, args.seq_min)
+    rejets_above = confirmer(ev_above, px, tns, "buy", confirm_ns) if len(ev_above) else []
+    rejets_below = confirmer(ev_below, px, tns, "sell", confirm_ns) if len(ev_below) else []
+    print(f"  {len(rejets_above):,} rejets 'above' confirmes / "
+          f"{len(rejets_below):,} rejets 'below' confirmes ({args.confirm}s sans depassement)")
+
+    if args.sens == "buy":
+        rejets_principal, rejets_oppose = rejets_above, rejets_below
+    else:
+        rejets_principal, rejets_oppose = rejets_below, rejets_above
+
+    df = identifier(rejets_principal, args.sens, args.gap_max, args.seq_max, args.seq_min)
     print(f"  {len(df):,} sequences identifiees "
           f"(ecart <= {args.gap_max} pts, delai {args.seq_min}-{args.seq_max}s)")
 
     if len(df):
         df = mesurer_suite(df, px, tns, args.sens, args.confirm, args.horizon)
+        if not args.sans_chemin_oppose:
+            df = verifier_chemin_oppose(df, rejets_oppose, args.confirm, args.horizon)
+        if not args.sans_backtest:
+            df = simuler_trade(df, px, tns, args.sens, args.confirm,
+                                args.target, args.stop_buffer, args.horizon)
 
-    rapport(df, args.sens)
+    rapport(df, args.sens, args.target, args.cout)
 
     if len(df):
         out = Path(args.fichiers[0]).with_name(f"identifie_{args.sens}.csv")
