@@ -236,7 +236,11 @@ def rapport(df: pd.DataFrame):
         print("\nAucune sequence. Desserre CONFIRM_SECS, SEQ_MAX_SECS ou GAP_MAX_TICKS.")
         return
 
-    print(f"\nRisque median (entree -> stop) : {df['risque_ticks'].median():.1f} ticks")
+    jours = df["t_entree"].dt.date
+    n_jours = jours.nunique()
+    print(f"\nCouverture : {jours.min()} -> {jours.max()}  "
+          f"({n_jours} jours, {n/n_jours:.1f} sequences/jour)")
+    print(f"Risque median (entree -> stop) : {df['risque_ticks'].median():.1f} ticks")
     print(f"Taux de stop                   : {df['stoppe'].mean():.0%}")
 
     print("\n--- Distribution du MFE (excursion favorable max) ---")
@@ -262,11 +266,12 @@ def rapport(df: pd.DataFrame):
     print(f"\nMediane du temps jusqu'au MFE : {df['t_to_mfe_s'].median():.0f} s")
     print("  -> si c'est court, un stop temporel elimine les trades qui trainent.")
 
-    print("\n--- Apercu ---")
+    print("\n--- Apercu (echantillon reparti sur toute la periode) ---")
     cols = ["t_entree", "B1", "B2", "gap_ticks", "ecart_secs",
             "risque_ticks", "mfe_ticks", "mae_ticks", "t_to_mfe_s", "stoppe"]
-    with pd.option_context("display.max_rows", 15, "display.width", 200):
-        print(df[cols].head(15).to_string(index=False))
+    pas = max(1, n // 15)
+    with pd.option_context("display.max_rows", 20, "display.width", 200):
+        print(df[cols].iloc[::pas].head(15).to_string(index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +285,8 @@ def main():
     ap.add_argument("--fin", default=SESSION_END)
     ap.add_argument("--confirm", type=int, default=CONFIRM_SECS)
     ap.add_argument("--niveaux", type=int, default=MIN_LEVELS)
+    ap.add_argument("--volume", type=float, default=MIN_VOLUME,
+                    help="volume minimum du sweep en lots (defaut : aucun). C'est le filtre qui separe une vraie agression du flux ordinaire.")
     ap.add_argument("--risque", type=float, default=MAX_RISQUE_TICKS,
                     help="ecart max entree-stop en ticks (defaut 8)")
     ap.add_argument("--stop", type=float, default=STOP_TICKS,
@@ -300,10 +307,11 @@ def main():
         print("      Verifie l'heure du pic de volume et ajuste --debut/--fin.")
         sys.exit(1)
 
-    print(f"\nDetection des sweeps (>={args.niveaux} niveaux, volume libre) ...")
+    seuil = f">={args.volume:.0f} lots" if args.volume else "volume libre"
+    print(f"\nDetection des sweeps (>={args.niveaux} niveaux, {seuil}) ...")
     sweeps = detect_tape_sweeps(
         session, window_ms=WINDOW_MS, min_levels=args.niveaux,
-        min_volume=MIN_VOLUME, tick_size=TICK, min_directional_ratio=DIR_RATIO,
+        min_volume=args.volume, tick_size=TICK, min_directional_ratio=DIR_RATIO,
     )
     n_sens = sum(1 for s in sweeps if s.direction == args.sens)
     print(f"  {len(sweeps):,} sweeps dont {n_sens:,} en '{args.sens}'")
