@@ -460,6 +460,9 @@ def main():
                     help="desactive la verification A (plus rapide)")
     ap.add_argument("--sans-backtest", action="store_true",
                     help="desactive le backtest B")
+    ap.add_argument("--filtre-conteste", action="store_true",
+                    help="ne backtest que les sequences avec chemin conteste "
+                         "(contra_rejets >= 1) — necessite --sans-chemin-oppose desactive")
     args = ap.parse_args()
 
     print(f"Chargement de {len(args.fichiers)} fichier(s) ...")
@@ -501,6 +504,11 @@ def main():
         df = mesurer_suite(df, px, tns, args.sens, args.confirm, args.horizon)
         if not args.sans_chemin_oppose:
             df = verifier_chemin_oppose(df, rejets_oppose, args.confirm, args.horizon)
+        if args.filtre_conteste and "contra_rejets" in df.columns:
+            avant = len(df)
+            df = df[df["contra_rejets"] > 0].reset_index(drop=True)
+            print(f"  Filtre chemin conteste : {len(df):,} sequences retenues "
+                  f"(sur {avant:,})")
         if not args.sans_backtest:
             df = simuler_trade(df, px, tns, args.sens, args.confirm,
                                 args.target, args.stop_buffer, args.horizon)
