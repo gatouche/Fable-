@@ -146,6 +146,66 @@ def identifier(rejets: list, sens: str, gap_max_points: float,
 
 
 # ---------------------------------------------------------------------------
+# Mesure de la suite — combien de points avant que B2 finisse par ceder ?
+# Aucune decision de trade ici (pas de stop, pas d'entree) : on mesure juste
+# la duree de vie du niveau, comme le fait enrich.py pour le modele A/B.
+# ---------------------------------------------------------------------------
+
+def mesurer_suite(df: pd.DataFrame, px: np.ndarray, tns: np.ndarray,
+                   sens: str, confirm_secs: int, horizon_secs: int = 3600) -> pd.DataFrame:
+    """
+    A partir du moment ou le 2e rejet est confirme, mesure :
+      - ext_max_pts  : plus grand ecart favorable atteint (B2 tient, le prix
+                        s'en eloigne) avant que B2 soit repasse dans l'autre sens
+      - t_ext_max_s  : temps ecoule jusqu'a ce point
+      - invalide     : est-ce que B2 a fini par ceder dans l'horizon ?
+      - t_invalide_s : temps ecoule jusqu'a la cession, si applicable
+    """
+    horizon_ns = horizon_secs * NS
+    confirm_ns = confirm_secs * NS
+    ext_max, t_ext_max, invalide, t_invalide = [], [], [], []
+
+    for r in df.itertuples():
+        origin_ns = pd.Timestamp(r.t_rejet_2).value + confirm_ns
+        cap_ns = origin_ns + horizon_ns
+        lo = int(np.searchsorted(tns, origin_ns, side="right"))
+        hi = int(np.searchsorted(tns, cap_ns, side="right"))
+        if hi <= lo:
+            ext_max.append(np.nan); t_ext_max.append(np.nan)
+            invalide.append(False); t_invalide.append(np.nan)
+            continue
+
+        seg, segt = px[lo:hi], tns[lo:hi]
+        if sens == "buy":               # rejet acheteur -> favorable = prix baisse
+            favorable = r.B2 - seg
+            casse = seg > r.B2
+        else:                           # rejet vendeur -> favorable = prix monte
+            favorable = seg - r.B2
+            casse = seg < r.B2
+
+        if casse.any():
+            j = int(np.argmax(casse))
+            pre = favorable[:j + 1]
+            invalide.append(True)
+            t_invalide.append(round((int(segt[j]) - origin_ns) / NS, 1))
+        else:
+            pre = favorable
+            invalide.append(False)
+            t_invalide.append(np.nan)
+
+        jm = int(np.argmax(pre))
+        ext_max.append(round(max(0.0, float(pre[jm])), 2))
+        t_ext_max.append(round((int(segt[jm]) - origin_ns) / NS, 1))
+
+    df = df.copy()
+    df["ext_max_pts"] = ext_max
+    df["t_ext_max_s"] = t_ext_max
+    df["invalide"] = invalide
+    df["t_invalide_s"] = t_invalide
+    return df
+
+
+# ---------------------------------------------------------------------------
 
 def rapport(df: pd.DataFrame, sens: str):
     n = len(df)
@@ -165,6 +225,30 @@ def rapport(df: pd.DataFrame, sens: str):
           f" | max {df['ecart_secs'].max():.0f} s")
     print(f"Volume (info, non filtre) : evt.1 median {df['vol_1'].median():.0f}"
           f" | evt.2 median {df['vol_2'].median():.0f}")
+
+    if "ext_max_pts" in df.columns:
+        print("\n--- Combien de points avant que B2 finisse par ceder ---")
+        print("(mesure pure : pas de stop, pas d'entree — juste la duree de vie du niveau)")
+        bornes = [-0.01, 0, 1, 2, 3, 5, 8, 1e9]
+        noms = ["0", "0-1", "1-2", "2-3", "3-5", "5-8", "8+"]
+        b = pd.cut(df["ext_max_pts"], bins=bornes, labels=noms)
+        cum = 0
+        for nom in noms:
+            c = int((b == nom).sum())
+            cum += c
+            print(f"  {nom:>4} pts : {c:>4}  ({100*c/n:5.1f} %)   cumul {100*cum/n:5.1f} %")
+        print(f"  Mediane du temps jusqu'au max : {df['t_ext_max_s'].median():.0f} s")
+        print(f"  B2 finit par ceder (dans l'horizon) : {df['invalide'].mean():.0%}")
+        if df["invalide"].any():
+            print(f"  Temps median avant que ca cede      : "
+                  f"{df.loc[df['invalide'], 't_invalide_s'].median():.0f} s")
+
+    print("\n--- Distribution horaire (heure du 2e rejet) ---")
+    heures = df["t_rejet_2"].dt.hour
+    for h in sorted(heures.unique()):
+        c = int((heures == h).sum())
+        barre = "#" * int(40 * c / heures.value_counts().max())
+        print(f"  {h:02d}h : {c:>4}  {barre}")
 
     print("\n--- Liste complete ---")
     with pd.option_context("display.max_rows", None, "display.width", 200):
@@ -213,6 +297,9 @@ def main():
                     help="delai min entre les deux rejets, en secondes "
                          "(exclut les fragments d'un meme sursaut)")
     ap.add_argument("--group-ms", type=int, default=GROUP_MS)
+    ap.add_argument("--horizon", type=int, default=3600,
+                    help="duree max de suivi apres confirmation, en secondes "
+                         "(defaut 3600 = 1h)")
     args = ap.parse_args()
 
     print(f"Chargement de {len(args.fichiers)} fichier(s) ...")
@@ -243,6 +330,9 @@ def main():
     df = identifier(rejets, args.sens, args.gap_max, args.seq_max, args.seq_min)
     print(f"  {len(df):,} sequences identifiees "
           f"(ecart <= {args.gap_max} pts, delai {args.seq_min}-{args.seq_max}s)")
+
+    if len(df):
+        df = mesurer_suite(df, px, tns, args.sens, args.confirm, args.horizon)
 
     rapport(df, args.sens)
 
