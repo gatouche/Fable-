@@ -64,10 +64,27 @@ def charger(path: str) -> pd.DataFrame:
 
 
 def classifier(df: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute la colonne bucket : les 5 categories du tape."""
+    """
+    Marque les executions selon les deux definitions possibles.
+
+    'above' / 'below' : execution strictement hors du spread.
+
+    'sweep' : definition de Jigsaw — "a sweep occurs when a buyer buys up all
+    the contracts offered on the inside offer". On ne dispose pas des
+    quantites du carnet, mais la consequence est observable : si toute
+    l'offre est prise, le meilleur ask doit remonter juste apres. On marque
+    donc les executions a l'offre suivies d'une remontee de l'ask.
+    """
     spread_ok = df["ask"] > df["bid"]
+    px, bid, ask = df["price"].values, df["bid"].values, df["ask"].values
+
     df["above"] = spread_ok & (df["price"] > df["ask"])
     df["below"] = spread_ok & (df["price"] < df["bid"])
+
+    monte = np.append(ask[1:] > ask[:-1], False)     # l'offre s'eleve ensuite
+    baisse = np.append(bid[1:] < bid[:-1], False)    # le bid s'efface ensuite
+    df["sweep_buy"] = (px >= ask) & monte
+    df["sweep_sell"] = (px <= bid) & baisse
     return df
 
 
@@ -247,6 +264,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("fichier")
     ap.add_argument("--sens", choices=["buy", "sell"], default="buy")
+    ap.add_argument("--mode", choices=["sweep", "above"], default="sweep",
+                    help="sweep = definition Jigsaw, toute l'offre consommee "
+                         "(defaut) ; above = execution hors du spread")
     ap.add_argument("--debut", default=SESSION_START)
     ap.add_argument("--fin", default=SESSION_END)
     ap.add_argument("--volume", type=float, default=MIN_VOLUME,
@@ -263,15 +283,22 @@ def main():
     n = len(full)
     print(f"  {n:,} ticks — {full['time'].iloc[0]} -> {full['time'].iloc[-1]}")
 
-    # --- LE test prealable : ces prints existent-ils seulement ? -------------
+    # --- Les deux definitions, cote a cote -----------------------------------
     n_above, n_below = int(full["above"].sum()), int(full["below"].sum())
-    print(f"\n  Above ask : {n_above:,} ({100*n_above/n:.3f} %)")
-    print(f"  Below bid : {n_below:,} ({100*n_below/n:.3f} %)")
-    if n_above + n_below == 0:
+    n_sb, n_ss = int(full["sweep_buy"].sum()), int(full["sweep_sell"].sum())
+    print(f"\n  Hors spread   — above ask : {n_above:,} ({100*n_above/n:.3f} %)"
+          f" | below bid : {n_below:,} ({100*n_below/n:.3f} %)")
+    print(f"  Offre nettoyee — buy : {n_sb:,} ({100*n_sb/n:.3f} %)"
+          f" | sell : {n_ss:,} ({100*n_ss/n:.3f} %)")
+
+    if args.mode == "above" and n_above + n_below == 0:
         print("\n  BLOQUANT : aucune execution hors du spread dans ce fichier.")
-        print("  L'export enregistre le quote APRES le trade, donc l'ask a deja")
-        print("  remonte au prix du trade. Ce que tu vois colore sur Jigsaw est")
-        print("  absent de ces donnees — il faut une autre source.")
+        print("  L'export enregistre probablement le quote APRES le trade.")
+        print("  Relance avec --mode sweep, qui ne depend pas de cette condition.")
+        sys.exit(1)
+    if args.mode == "sweep" and n_sb + n_ss == 0:
+        print("\n  BLOQUANT : le quote ne bouge jamais apres une execution.")
+        print("  Les colonnes bid/ask de cet export ne sont pas exploitables.")
         sys.exit(1)
 
     t = full["time"].dt.time
@@ -280,9 +307,12 @@ def main():
     print(f"\n  Session {args.debut}-{args.fin} : {len(session):,} ticks "
           f"({len(session)/n:.1%})")
 
-    masque = session["above"] if args.sens == "buy" else session["below"]
-    ev = grouper(session, masque, args.sens, args.group_ms * 1_000_000)
-    print(f"\n  {len(ev):,} evenements hors spread regroupes "
+    if args.mode == "sweep":
+        colonne = "sweep_buy" if args.sens == "buy" else "sweep_sell"
+    else:
+        colonne = "above" if args.sens == "buy" else "below"
+    ev = grouper(session, session[colonne], args.sens, args.group_ms * 1_000_000)
+    print(f"\n  {len(ev):,} evenements '{args.mode}' regroupes "
           f"(fenetre {args.group_ms} ms)")
     if ev.empty:
         return
