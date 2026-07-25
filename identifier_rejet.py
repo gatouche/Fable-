@@ -167,9 +167,34 @@ def rapport(df: pd.DataFrame, sens: str):
         print(df.to_string(index=False))
 
 
+def charger_plusieurs(chemins: list[str]) -> pd.DataFrame:
+    """
+    Charge et fusionne plusieurs fichiers de ticks.
+
+    Si deux exports se chevauchent sur les memes dates (par ex. ticks_ES.csv
+    et ticks_ES_full.csv), les lignes identiques (meme time/price/bid/ask/qty)
+    sont dedupliquees pour ne pas compter un evenement deux fois.
+    """
+    morceaux = []
+    for chemin in chemins:
+        df = charger(chemin)
+        print(f"  {chemin} : {len(df):,} ticks — "
+              f"{df['time'].iloc[0]} -> {df['time'].iloc[-1]}")
+        morceaux.append(df)
+
+    full = pd.concat(morceaux, ignore_index=True)
+    avant = len(full)
+    full = full.drop_duplicates(subset=["time", "price", "bid", "ask", "qty"])
+    doublons = avant - len(full)
+    if doublons:
+        print(f"  {doublons:,} lignes en double (chevauchement entre fichiers) retirees")
+    return full.sort_values("time").reset_index(drop=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("fichier")
+    ap.add_argument("fichiers", nargs="+",
+                    help="un ou plusieurs CSV de ticks, fusionnes automatiquement")
     ap.add_argument("--sens", choices=["buy", "sell"], default="buy",
                     help="buy = above-ask rejetes (acheteurs pieges, defaut)")
     ap.add_argument("--debut", default=SESSION_START)
@@ -183,10 +208,11 @@ def main():
     ap.add_argument("--group-ms", type=int, default=GROUP_MS)
     args = ap.parse_args()
 
-    print(f"Chargement de {args.fichier} ...")
-    full = classifier(charger(args.fichier))
+    print(f"Chargement de {len(args.fichiers)} fichier(s) ...")
+    full = classifier(charger_plusieurs(args.fichiers))
     n = len(full)
-    print(f"  {n:,} ticks — {full['time'].iloc[0]} -> {full['time'].iloc[-1]}")
+    print(f"\n  Total fusionne : {n:,} ticks — "
+          f"{full['time'].iloc[0]} -> {full['time'].iloc[-1]}")
 
     t = full["time"].dt.time
     d, f = pd.Timestamp(args.debut).time(), pd.Timestamp(args.fin).time()
@@ -214,7 +240,7 @@ def main():
     rapport(df, args.sens)
 
     if len(df):
-        out = Path(args.fichier).with_name(f"identifie_{args.sens}.csv")
+        out = Path(args.fichiers[0]).with_name(f"identifie_{args.sens}.csv")
         df.to_csv(out, index=False)
         print(f"\nExporte -> {out}")
 
